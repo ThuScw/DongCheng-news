@@ -1,0 +1,2 @@
+[console_scripts]
+dcnew = dcnews.cli:main

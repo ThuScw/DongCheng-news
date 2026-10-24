@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dcnew"
+version = "1.4"
+description = "北京市东城区新闻监测爬取 CLI（Scrapling + GNE，57 个数据源）"
+requires-python = ">=3.9"
+dependencies = [
+    "scrapling>=0.5",
+    "gne>=0.0.6",
+    "requests>=2.28",
+    "openpyxl>=3.1",
+    # Scrapling 0.5 内部无条件导入但未声明为依赖，需显式安装
+    "patchright>=1.60",
+    "curl_cffi>=0.7",
+    "browserforge>=1.0",
+]
+
+[project.scripts]
+dcnew = "dcnews.cli:main"
+
+[tool.setuptools]
+packages = ["dcnews"]

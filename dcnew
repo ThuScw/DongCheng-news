@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# dcnew —— 东城区新闻监测 CLI 启动器
+# 用法：
+#   ./dcnew start [YYYYMMDD]     启动后台监听（可选起点日期）
+#   ./dcnew stop                 停止监听
+#   ./dcnew status               状态查询
+#   ./dcnew crawl                前台立即抓取一轮
+#   ./dcnew download [d]         拉取最近 d 天数据并生成 Excel（默认 7）
+#   ./dcnew latest [d]           终端列举最近 d 条新闻（默认 10）
+#
+# 说明：优先使用本项目目录下的 .venv 虚拟环境，其次回退系统 python3。
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -x "$DIR/.venv/bin/python" ]; then
+    exec "$DIR/.venv/bin/python" "$DIR/dcnews.py" "$@"
+else
+    exec python3 "$DIR/dcnews.py" "$@"
+fi
