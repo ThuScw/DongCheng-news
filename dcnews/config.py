@@ -69,8 +69,14 @@ DEFAULT_INTERVAL_MIN = 20
 HTTP_TIMEOUT = 25
 # 每个周期内每个源最多补抓文章详情页条数
 ENRICH_LIMIT_PER_SOURCE = 40
+# 单篇文章最大富化尝试次数（避免死链每周期重复请求）
+ENRICH_MAX_ATTEMPTS = 3
 # 中断补爬的最大回溯天数（防止日志丢失后无限回溯）
 MAX_BACKFILL_DAYS = 180
+# 电子报按日期回溯的最大天数
+EPAPER_MAX_BACKFILL_DAYS = 180
+# 补爬时搜索型源的翻页上限
+SEARCH_MAX_PAGES = 10
 # 断点判定：心跳缺失超过 N 个周期视为中断
 INTERRUPT_FACTOR = 2
 

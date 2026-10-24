@@ -62,6 +62,8 @@ def _clean_title(raw: str) -> str:
     s = re.sub(r"\s*\d+(?:评论|阅读|浏览|播放|次|人|赞|浏览量)\s*$", "", s)
     s = re.sub(r"\s*(?:\d+天前|\d+小时前|\d+分钟前|刚刚|今天|昨天|前天)\s*$", "", s)
     s = re.sub(r"^\s*(?:视频|图文|直播|专题|海报)\s*[|｜]?\s*", "", s)
+    # 列表页常把排名/条数拼在标题前（如“9 东城公安…”），仅在有空格时剥离
+    s = re.sub(r"^\d{1,3}\s+(?=\S)", "", s)
     if len(_CJK.findall(s)) < 4:
         return ""
     return s
@@ -256,25 +258,61 @@ class ThepaperSearch:
 
 
 def _parse_pub_time(v):
-    v = str(v or "")
+    """解析中文时间文本：绝对日期、相对时间（刚刚/N分钟前/昨天21:36）。"""
+    v = str(v or "").strip()
     if not v:
         return "", ""
-    if re.match(r"^\d{4}-\d{2}-\d{2}", v):
-        return v[:10], (v[:16] if len(v) >= 16 else v[:10])
-    m = re.match(r"(\d+)天前", v)
+
+    # 绝对日期：2026-10-22 09:23:16 / 2026年10月22日 09:23
+    m = re.match(
+        r"^\s*(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})日?"
+        r"(?:[ T](\d{1,2}):(\d{2}))?", v)
     if m:
-        dt = datetime.now() - timedelta(days=int(m.group(1)))
-        return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d")
-    m = re.match(r"(\d+)小时前", v)
-    if m:
-        dt = datetime.now() - timedelta(hours=int(m.group(1)))
+        try:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                          int(m.group(4) or 0), int(m.group(5) or 0))
+        except ValueError:
+            return "", ""
         return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d %H:%M")
-    if "昨天" in v or "前天" in v:
-        dt = datetime.now() - timedelta(days=1 if "昨天" in v else 2)
-        return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d")
-    if "今天" in v:
-        return datetime.now().strftime("%Y-%m-%d"), \
-            datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # epoch 秒/毫秒（头条 publish_time）
+    if re.match(r"^\d{10,13}$", v):
+        try:
+            ts = int(v)
+            dt = datetime.fromtimestamp(ts / (1000.0 if ts > 10 ** 12 else 1.0))
+            return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OSError):
+            return "", ""
+
+    now = datetime.now()
+    if "刚刚" in v:
+        return now.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d %H:%M")
+
+    m = re.search(r"(\d+)\s*分钟前", v)
+    if m:
+        dt = now - timedelta(minutes=int(m.group(1)))
+        return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d %H:%M")
+
+    m = re.search(r"(\d+)\s*小时前", v)
+    if m:
+        dt = now - timedelta(hours=int(m.group(1)))
+        return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d %H:%M")
+
+    m = re.search(r"(\d+)\s*天前", v)
+    if m:
+        dt = now - timedelta(days=int(m.group(1)))
+        return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d %H:%M")
+
+    days = 1 if "昨天" in v else (2 if "前天" in v else (0 if "今天" in v else None))
+    if days is not None:
+        hm = re.search(r"(\d{1,2}):(\d{2})", v)
+        dt = now - timedelta(days=days)
+        if hm:
+            try:
+                dt = dt.replace(hour=int(hm.group(1)), minute=int(hm.group(2)))
+            except ValueError:
+                pass
+        return dt.strftime("%Y-%m-%d"), dt.strftime("%Y-%m-%d %H:%M")
     return "", ""
 
 
@@ -283,50 +321,102 @@ def _parse_pub_time(v):
 # =========================================================
 
 class BaiduSearch:
-    """百度资讯搜索：全网新闻聚合（Scrapling 解析服务端渲染页）。
+    """百度资讯搜索：全网新闻聚合（requests 拉取 + Selector 解析）。
 
-    结果标题真实、链接多为百家号/媒体直链；反爬风险由 fetch_page
-    的失败重试与周期容错兜底。
+    百度对 Scrapling 的浏览器指纹会弹验证码，故这里复用 requests 会话；
+    结果块中可读到“新闻来源：XXX”与“发布于：N小时前”，据此回填
+    原始媒体与发布时间（不再统一写成“百度资讯聚合”）。
     """
     key = "baidu"
     base = "https://www.baidu.com/s"
     queries = ["北京东城", "东城区"]
 
     def search(self, date_from=None, date_to=None, max_pages=3):
-        results = []
+        results, seen = [], set()
         for kw in self.queries:
             url = (f"{self.base}?wd={urllib.parse.quote(kw)}"
                    f"&tn=news&rtt=4&bsst=1&cl=2")
-            page = net.fetch_page(url)
+            page = net.fetch_page_decoded(url, encoding="utf-8", retries=1)
             if page is None:
                 continue
-            for h3 in page.css("h3"):
-                a = h3.find("a")
-                if a is None:
-                    continue
-                title = net.clean_text(a.get_all_text() or "")
-                href = a.attrib.get("href", "") or ""
-                if not (title and href and len(title) > 8):
-                    continue
-                if href.startswith("http://www.baidu.com/link"):
-                    continue  # 跳过需二次跳转的链接，保留直链
-                d, t = "", ""
-                m = re.search(r"(20\d{2}-\d{2}-\d{2})", h3.html_content or "")
-                if m:
-                    d = t = m.group(1)
-                if not d:
+            blocks = page.css("div.result-op")
+            if blocks:
+                for blk in blocks:
+                    h3s = blk.css("h3")
+                    a = h3s[0].find("a") if h3s else None
+                    if a is None:
+                        continue
+                    it = self._parse_block(blk, a)
+                    if it is None or it["url"] in seen:
+                        continue
+                    d = it["pub_date"]
+                    if date_from and d and d < date_from:
+                        continue
+                    if date_to and d and d > date_to:
+                        continue
+                    seen.add(it["url"])
+                    results.append(it)
+            else:
+                # 旧版结构兜底：h3 锚点直接解析
+                for h3 in page.css("h3"):
+                    a = h3.find("a")
+                    if a is None:
+                        continue
+                    title = net.clean_text(a.get_all_text() or "")
+                    href = a.attrib.get("href", "") or ""
+                    if not (title and href and len(title) > 8):
+                        continue
+                    if href.startswith("http://www.baidu.com/link"):
+                        continue
+                    if href in seen:
+                        continue
                     d, t = parse_date_from_url(href)
-                if date_from and d and d < date_from:
-                    continue
-                if date_to and d and d > date_to:
-                    continue
-                results.append(_mk(href, title, "百度资讯聚合",
-                                   d, t, title, self.key))
+                    if date_from and d and d < date_from:
+                        continue
+                    if date_to and d and d > date_to:
+                        continue
+                    seen.add(href)
+                    results.append(_mk(href, title, "百度资讯聚合",
+                                       d, t, title, self.key))
         return results
+
+    def _parse_block(self, blk, a):
+        title = net.clean_text(a.get_all_text() or "")
+        href = a.attrib.get("href", "") or ""
+        if not (title and href and len(title) > 8):
+            return None
+        if href.startswith("http://www.baidu.com/link"):
+            return None  # 需二次跳转的链接无法稳定提取正文
+        media = ""
+        for s in blk.css("span.c-color-gray"):
+            label = (s.attrib.get("aria-label") or "").strip()
+            if label.startswith("新闻来源"):
+                media = net.clean_text(label.split("：", 1)[-1])
+                break
+        time_label = ""
+        for s in blk.css("span.c-color-gray2"):
+            label = (s.attrib.get("aria-label") or "").strip()
+            if label.startswith("发布于"):
+                time_label = label.split("：", 1)[-1]
+                break
+        d, t = _parse_pub_time(time_label)
+        if not d:
+            d, t = parse_date_from_url(href)
+        summary = ""
+        for s in blk.css("span.c-color-text"):
+            summary = net.clean_text(s.get_all_text() or "")
+            break
+        return _mk(href, title, media or "百度资讯聚合",
+                   d, t, summary, self.key)
 
 
 class ToutiaoSearch:
-    """今日头条搜索（so.toutiao.com）：cr-params 卡片解析 + zlink 解码。"""
+    """今日头条搜索（so.toutiao.com）：cr-params 卡片解析 + zlink 解码。
+
+    页面同时内嵌每张卡片的数据脚本，含 media_name / publish_time /
+    datetime；解析为 gid → (原始媒体, 发布时间) 映射后回填，
+    避免所有条目都记成“今日头条聚合”。
+    """
     key = "toutiao"
     base = "https://so.toutiao.com/search"
     queries = ["北京东城", "东城区"]
@@ -341,6 +431,7 @@ class ToutiaoSearch:
             if page is None:
                 continue
             t = page.html_content or ""
+            meta = _toutiao_meta(t)
             for m in re.finditer(r"cr-params='(\{\"gid\".{0,600}?)'", t):
                 raw = m.group(1)
                 tm = re.search(r'"title":"([^"]{8,90})"', raw)
@@ -349,38 +440,57 @@ class ToutiaoSearch:
                 if not tm:
                     continue
                 title = net.clean_text(tm.group(1))
+                gid = gm.group(1) if gm else ""
                 real = ""
                 if um and "zlink" in um.group(1):
                     q = urllib.parse.parse_qs(
                         urllib.parse.urlparse(um.group(1)).query)
                     real = urllib.parse.unquote(
                         q.get("h5_url", [""])[0]) or um.group(1)
-                elif gm:
-                    real = f"https://www.toutiao.com/group/{gm.group(1)}/"
+                elif gid:
+                    real = f"https://www.toutiao.com/group/{gid}/"
                 elif um and um.group(1).startswith("http"):
                     real = um.group(1)
                 if not (title and real) or real in seen:
                     continue
                 seen.add(real)
-                # 时间：卡片内嵌 createTime（epoch 秒）
-                d, t_s = "", ""
-                cm = re.search(r'"createTime":"?(\d{10})"?', t[m.end():m.end() + 3000])
-                if cm:
-                    try:
-                        dt = datetime.fromtimestamp(int(cm.group(1)))
-                        d = dt.strftime("%Y-%m-%d")
-                        t_s = dt.strftime("%Y-%m-%d %H:%M")
-                    except Exception:
-                        pass
+                media, time_val = meta.get(gid, ("", ""))
+                d, t_s = _parse_pub_time(time_val)
+                if not d:
+                    # 兼容旧版页面：卡片内嵌 createTime（epoch 秒）
+                    cm = re.search(r'"createTime":"?(\d{10})"?',
+                                   t[m.end():m.end() + 3000])
+                    if cm:
+                        d, t_s = _parse_pub_time(cm.group(1))
                 if not d:
                     d, t_s = parse_date_from_url(real)
                 if date_from and d and d < date_from:
                     continue
                 if date_to and d and d > date_to:
                     continue
-                results.append(_mk(real, title, "今日头条聚合",
+                results.append(_mk(real, title, media or "今日头条聚合",
                                    d, t_s, title, self.key))
         return results
+
+
+def _toutiao_meta(html: str):
+    """从头条数据脚本中提取 gid → (media_name, 发布时间) 映射。"""
+    meta = {}
+    for _bid, body in re.findall(
+            r'<script[^>]*data-id="([^"]+)"[^>]*>(.*?)</script>',
+            html or "", re.S):
+        mm = re.search(r'"media_name":"([^"]{1,40})"', body)
+        if not mm:
+            continue
+        media = net.clean_text(mm.group(1))
+        dt = re.search(r'"datetime":"([^"]{4,25})"', body)
+        ts = re.search(r'"publish_time":"?(\d{10,13})"?', body)
+        time_val = dt.group(1) if dt else (ts.group(1) if ts else "")
+        gids = re.findall(
+            r'"(?:gid|group_id|item_id)":"?(\d{10,25})"?', body)
+        for g in gids:
+            meta.setdefault(g, (media, time_val))
+    return meta
 
 
 # =========================================================
@@ -599,10 +709,10 @@ class Gmw(ListSource):
 
 
 class Cnr(ListSource):
-    """央广网（中央人民广播电台，GBK 编码）。"""
+    """央广网（中央人民广播电台，GBK 编码）：总站 + 北京频道。"""
     key = "cnr"
     media = "央广网"
-    pages = ["https://www.cnr.cn/"]
+    pages = ["https://www.cnr.cn/", "https://www.cnr.cn/bj/"]
     domain = "cnr.cn"
     encoding = "gb18030"
 
@@ -763,10 +873,10 @@ class Wenweipo(ListSource):
 
 
 class NetEase(ListSource):
-    """网易新闻。"""
+    """网易新闻：总站 + 北京频道（区级稿更常出现在地方频道）。"""
     key = "163"
     media = "网易"
-    pages = ["https://www.163.com/"]
+    pages = ["https://www.163.com/", "https://bj.news.163.com/"]
     domain = "163.com"
     art = re.compile(r"163\.com/[a-z]+/(?:dy/)?article/[0-9A-Z]+\.html")
 
@@ -1027,8 +1137,9 @@ class BjdEpaperSource:
                 out.append(it)
         return out
 
-    def search(self, date_from=None, date_to=None, max_days=90):
-        """按日期区间回溯版面（历史补爬）。"""
+    def search(self, date_from=None, date_to=None, max_days=None):
+        """按日期区间回溯版面（历史补爬，默认最多 180 天）。"""
+        max_days = max_days or config.EPAPER_MAX_BACKFILL_DAYS
         if not date_from:
             return self.fetch()
         d0 = datetime.strptime(date_from, "%Y-%m-%d")
@@ -1139,7 +1250,8 @@ class _NodeEpaperSource:
                 out.append(it)
         return out
 
-    def search(self, date_from=None, date_to=None, max_days=90):
+    def search(self, date_from=None, date_to=None, max_days=None):
+        max_days = max_days or config.EPAPER_MAX_BACKFILL_DAYS
         if not date_from:
             return self.fetch()
         d0 = datetime.strptime(date_from, "%Y-%m-%d")

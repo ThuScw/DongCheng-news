@@ -5,6 +5,7 @@ Scrapling 为核心抓取引擎（https://github.com/D4Vinci/Scrapling），
 其自适应选择器可在页面结构微调时保持解析稳定。
 """
 import logging
+import threading
 import time
 import random
 
@@ -20,14 +21,16 @@ logging.getLogger("curl_cffi").setLevel(logging.ERROR)
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-_fetcher = None
+_local = threading.local()
 
 
 def get_fetcher() -> Fetcher:
-    global _fetcher
-    if _fetcher is None:
-        _fetcher = Fetcher()
-    return _fetcher
+    """每线程一个 Fetcher：doctor 的并发探测不共享连接/会话状态。"""
+    fetcher = getattr(_local, "fetcher", None)
+    if fetcher is None:
+        fetcher = Fetcher()
+        _local.fetcher = fetcher
+    return fetcher
 
 
 def fetch_page(url: str, retries: int = 2, timeout: int = None):
@@ -45,15 +48,11 @@ def fetch_page(url: str, retries: int = 2, timeout: int = None):
     return None
 
 
-_session = None
-
-
 def fetch_page_decoded(url, encoding="gb18030", retries=1, timeout=None):
     """抓取 GBK/GB2312 编码站点：requests 拉取后按指定编码解码，
     返回 Scrapling Selector（保持一致的 CSS 解析体验）。"""
     from scrapling import Selector
     timeout = timeout or config.HTTP_TIMEOUT
-    import time as _t, random as _r
     for i in range(retries + 1):
         try:
             r = get_session().get(url, timeout=timeout)
@@ -63,19 +62,21 @@ def fetch_page_decoded(url, encoding="gb18030", retries=1, timeout=None):
         except Exception:
             if i >= retries:
                 return None
-        _t.sleep(1 + _r.random())
+        time.sleep(1 + random.random())
     return None
 
 
 def get_session() -> requests.Session:
-    global _session
-    if _session is None:
-        _session = requests.Session()
-        _session.headers.update({
+    """每线程一个 requests.Session（共享 Session 在并发下不安全）。"""
+    session = getattr(_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
             "User-Agent": UA,
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         })
-    return _session
+        _local.session = session
+    return session
 
 
 def get_json(url: str, params=None, post_json=None, retries: int = 2,

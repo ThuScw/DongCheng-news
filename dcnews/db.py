@@ -42,7 +42,9 @@ def init_db():
             match_level INTEGER,
             units       TEXT,
             category    TEXT,
-            fetched_at  TEXT
+            fetched_at  TEXT,
+            title_hash  TEXT,
+            enrich_attempts INTEGER DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_pub_date ON news(pub_date);
         CREATE INDEX IF NOT EXISTS idx_source  ON news(source_key);
@@ -52,6 +54,20 @@ def init_db():
         );
         """
     )
+    # 旧库迁移：补列并回填标题去重键
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(news)")}
+    if "title_hash" not in cols:
+        conn.execute("ALTER TABLE news ADD COLUMN title_hash TEXT")
+    if "enrich_attempts" not in cols:
+        conn.execute(
+            "ALTER TABLE news ADD COLUMN enrich_attempts INTEGER DEFAULT 0")
+    rows = conn.execute(
+        "SELECT id, title, media FROM news "
+        "WHERE title_hash IS NULL OR title_hash = ''").fetchall()
+    for r in rows:
+        conn.execute("UPDATE news SET title_hash=? WHERE id=?",
+                     (title_key(r["title"], r["media"]), r["id"]))
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_title_hash ON news(title_hash)")
     conn.commit()
 
 
@@ -59,6 +75,21 @@ def url_key(url: str) -> str:
     """URL 去重键：去掉 query/fragment 的规整化哈希。"""
     u = re.sub(r"[?#].*$", "", (url or "").strip())
     return hashlib.md5(u.encode("utf-8")).hexdigest()
+
+
+def normalize_title(title: str) -> str:
+    """标题规整：去掉所有空白（含全角空格），用于同媒体同题去重。"""
+    return re.sub(r"\s+", "", (title or "").strip())
+
+
+def title_key(title: str, media: str) -> str:
+    """标题去重键：同一媒体 + 同一标题视为同一条稿件。
+
+    聚合源与电子报常出现同一稿件对应多个 URL（PC/移动版），
+    仅按 URL 去重会漏；跨媒体同题仍保留，因为发稿统计需要分别计数。
+    """
+    payload = f"{normalize_title(title)}|{(media or '').strip()}"
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
 
 def insert_news(item: dict) -> bool:
@@ -69,12 +100,19 @@ def insert_news(item: dict) -> bool:
     """
     conn = get_conn()
     h = url_key(item.get("url", ""))
+    h2 = title_key(item.get("title", ""), item.get("media", ""))
+    # 同媒体同题：URL 不同也视为重复（PC/移动版、聚合源多链接）
+    if conn.execute(
+            "SELECT 1 FROM news WHERE title_hash=? LIMIT 1", (h2,)
+    ).fetchone():
+        return False
     cur = conn.execute(
         """
         INSERT OR IGNORE INTO news
         (url_hash, url, title, media, source_key, pub_date, pub_time,
-         summary, keyword, match_level, units, category, fetched_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+         summary, keyword, match_level, units, category, fetched_at,
+         title_hash)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             h, item.get("url", ""), item.get("title", ""),
@@ -85,6 +123,7 @@ def insert_news(item: dict) -> bool:
             "、".join(item.get("units", []) or []),
             item.get("category", ""),
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            h2,
         ),
     )
     conn.commit()
@@ -170,18 +209,32 @@ get_latest = latest_news          # reporter 使用
 query_between = news_between      # exporter 使用
 
 
-def get_need_enrich(limit=40):
-    """取需要详情富化的条目：缺摘要或精确发布日期的最近记录。"""
+def get_need_enrich(limit=40, max_attempts=None):
+    """取需要详情富化的条目：缺摘要或精确发布日期的最近记录。
+
+    限制最大尝试次数，避免死链/反爬站点在每个周期被反复请求。
+    """
+    max_attempts = max_attempts or config.ENRICH_MAX_ATTEMPTS
     return get_conn().execute(
         """
         SELECT url, title, summary, pub_date, pub_time FROM news
         WHERE (summary='' OR summary IS NULL OR pub_date='' OR pub_date IS NULL)
           AND url IS NOT NULL AND url != ''
+          AND COALESCE(enrich_attempts, 0) < ?
         ORDER BY id DESC
         LIMIT ?
         """,
-        (limit,),
+        (max_attempts, limit),
     ).fetchall()
+
+
+def bump_enrich_attempt(url: str):
+    """记录一次富化尝试（成功或失败均计数）。"""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE news SET enrich_attempts = COALESCE(enrich_attempts, 0) + 1 "
+        "WHERE url_hash=?", (url_key(url),))
+    conn.commit()
 
 
 def query_by_date_range(d_from, d_to):

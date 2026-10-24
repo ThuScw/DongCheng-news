@@ -26,9 +26,8 @@ THIN = Border(*[Side(style="thin")] * 4)
 
 MEDIA_FALLBACK = {
     "cctv": "央视网", "chinadaily": "中国日报", "thepaper": "澎湃新闻",
-    "people_bj": "人民网", "xinhua_bj": "新华网", "chinanews": "中新网",
-    "qianlong": "千龙网", "bjnews": "新京报", "cri": "国际在线",
-    "bjdc_gov": "东城区人民政府网",
+    "chinanews": "中新网", "qianlong": "千龙网", "bjnews": "新京报",
+    "cri": "国际在线", "bjdc_gov": "东城区人民政府网",
 }
 
 
@@ -37,6 +36,26 @@ def _parse_date(s):
         return datetime.strptime(s, "%Y-%m-%d")
     except (TypeError, ValueError):
         return None
+
+
+def _safe_text(v):
+    """防止抓取文本以 = + - @ 开头时被 Excel 当作公式执行。"""
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@"):
+        return "'" + v
+    return v
+
+
+def _dedupe_rows(rows):
+    """导出侧兜底去重：同媒体 + 同标题 + 同日期只保留一条。"""
+    seen, out = set(), []
+    for r in rows:
+        key = (db.normalize_title(r.get("title", "")),
+               r.get("media") or "", r.get("pub_date") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
 
 
 def fetch_weekly_rows(days=7):
@@ -53,6 +72,7 @@ def fetch_weekly_rows(days=7):
         if d_from <= fa <= d_to:
             fetched_in_window.append(dict(r, pub_date=fa))
     rows = [dict(r) for r in rows] + fetched_in_window
+    rows = _dedupe_rows(rows)
     rows.sort(key=lambda r: (r["pub_date"] or "9999", r["media"] or "",
                              r["title"] or ""))
     return rows, d_from, d_to
@@ -94,13 +114,15 @@ def build_sheet(rows, d_from, d_to, title=None):
         values = [
             f"=ROW()-2",                                   # 序号（与模板一致）
             d,                                             # 日期
-            r.get("media") or MEDIA_FALLBACK.get(
-                r.get("source_key"), r.get("source_key") or "未知来源"),
-            r.get("title") or "",                          # 标题
-            banmian or None,                               # 版面（电子报填写）
+            _safe_text(r.get("media") or MEDIA_FALLBACK.get(
+                r.get("source_key"), r.get("source_key") or "未知来源")),
+            _safe_text(r.get("title") or ""),              # 标题
+            _safe_text(banmian) or None,                   # 版面（电子报填写）
             None,                                          # 位置
-            units[0] or None, units[1] or None, units[2] or None,
-            r.get("category") or "综合",
+            _safe_text(units[0]) or None,
+            _safe_text(units[1]) or None,
+            _safe_text(units[2]) or None,
+            _safe_text(r.get("category") or "综合"),
         ]
         for col, v in enumerate(values, start=1):
             c = ws.cell(row=excel_row, column=col, value=v)
@@ -136,7 +158,8 @@ def export_weekly(days=7, out_path=None, quiet=False):
             config.EXPORT_DIR,
             f"东城区新闻发稿统计_{d_from.replace('-', '')}"
             f"-{d_to.replace('-', '')}.xlsx")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    parent = os.path.dirname(os.path.abspath(out_path))
+    os.makedirs(parent, exist_ok=True)
     wb.save(out_path)
     if not quiet:
         print(f"已导出：{out_path}")

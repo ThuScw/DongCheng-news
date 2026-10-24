@@ -48,12 +48,19 @@ def extract_datetime(text: str):
 
 
 def parse_date_from_url(url: str):
-    """从 URL 路径提取日期（各门户常见模式）。"""
+    """从 URL 路径提取日期（各门户常见模式）。
+
+    只解析 path、不做全 URL 匹配：聚合页链接的查询串里常有长数字 ID
+    （如 baijiahao 的 id=20261024…），全串匹配会造出假日期。
+    年份两侧必须是非数字，避免从长 ID 中间截出 8 位数字。
+    """
     if not url:
         return None, None
-    m = re.search(r"20(\d{2})[/-]?(\d{2})[/-]?(\d{2})", url)
+    from urllib.parse import urlparse
+    path = urlparse(url).path or ""
+    m = re.search(r"(?<!\d)(20\d{2})([-/]?)(\d{2})\2(\d{2})(?!\d)", path)
     if m:
-        y, mo, d = 2000 + int(m.group(1)), int(m.group(2)), int(m.group(3))
+        y, mo, d = int(m.group(1)), int(m.group(3)), int(m.group(4))
         if 1 <= mo <= 12 and 1 <= d <= 31:
             try:
                 return (datetime(y, mo, d).strftime("%Y-%m-%d"),) * 2
@@ -180,4 +187,5 @@ def enrich_pending(items, limit=None):
                 r["pub_date"], r["pub_time"],
             )
             done += 1
+        db.bump_enrich_attempt(url)
     return done

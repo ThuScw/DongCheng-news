@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 构建产物
+build/
+dist/
+*.egg-info/
+*.whl
+
+# 本地配置
+.claude/settings.local.json
+
+# 运行时数据（首次运行自动创建）
+data/
+logs/
+exports/

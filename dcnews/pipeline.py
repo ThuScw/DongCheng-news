@@ -62,7 +62,9 @@ def run_cycle():
 def run_backfill(date_from: str, date_to: str = None):
     """按日期区间补爬（断点续爬/指定起点）。
 
-    使用支持时间检索的源：央视搜索、中国日报、澎湃、中新网滚动。
+    搜索型源按日期过滤并翻 config.SEARCH_MAX_PAGES 页；中新网按日滚动；
+    电子报按版面回溯（上限 config.EPAPER_MAX_BACKFILL_DAYS 天）。
+    重复执行是幂等的，中断后重新运行不会产生重复数据。
     """
     date_to = date_to or datetime.now().strftime("%Y-%m-%d")
     log.info("BACKFILL start date_from=%s date_to=%s", date_from, date_to)
@@ -70,7 +72,8 @@ def run_backfill(date_from: str, date_to: str = None):
     # 1) 搜索型源
     for src in sources.SEARCH_SOURCES:
         try:
-            items = src.search(date_from, date_to, max_pages=5)
+            items = src.search(date_from, date_to,
+                               max_pages=config.SEARCH_MAX_PAGES)
         except Exception as e:
             log.warning("补爬源 %s 失败: %s", src.key, e)
             continue

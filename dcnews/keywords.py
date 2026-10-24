@@ -183,6 +183,28 @@ def _has_context(text: str, source_key: str, beijing_media: set) -> bool:
 # 其它地名的拼接串，不能直接认定为北京市东城区
 _T1_BAD_PREFIX = "邵桥京新城山河湖江岭岗坡湾林平阳永鼓东西南北"
 
+# 街道简称的“前字排除表”：命中词前若出现这些字，说明是别的地名。
+# 目前仅“景山”会被“石景山”吞并，其余街道简称暂无需排除。
+_PLAIN_BAD_PREFIX = {"景山": "石", "景山街道": "石"}
+
+
+def _plain_hit(text: str, word: str):
+    """返回街道简称的有效首次出现位置；被别的地名吞并时返回 None。"""
+    blocked = _PLAIN_BAD_PREFIX.get(word, "")
+    start = 0
+    while True:
+        i = text.find(word, start)
+        if i < 0:
+            return None
+        if not (i > 0 and text[i - 1] in blocked):
+            return i
+        start = i + 1
+
+
+def _only_other_district(text: str) -> bool:
+    """文本明确指向其它区、且全文未出现“东城”时，不认街道简称命中。"""
+    return "东城" not in text and any(d in text for d in _OTHER_DISTRICTS)
+
 
 def match_dongcheng(title: str, summary: str = "", source_key: str = "",
                     beijing_media: frozenset = frozenset(),
@@ -201,14 +223,20 @@ def match_dongcheng(title: str, summary: str = "", source_key: str = "",
     has_bj = ("北京" in text or "首都" in text
               or any(w in text for w in TIER2) or source_key in bm)
 
-    # T1：强匹配词出现；非可信源需具备北京语境，并排除“邵东城区”等拼接串
+    # T1：强匹配词出现；非可信源需具备北京语境，并排除“邵东城区”等拼接串。
+    # 同一文本可能多次出现（先出现拼串、后出现真实地名），需扫描全部命中点。
     for w in TIER1:
-        idx = text.find(w)
-        if idx < 0:
-            continue
-        if idx > 0 and text[idx - 1] in _T1_BAD_PREFIX:
-            continue  # 疑似其它地名拼串
-        if has_bj or trusted:
+        found = False
+        start = 0
+        while True:
+            idx = text.find(w, start)
+            if idx < 0:
+                break
+            if idx == 0 or text[idx - 1] not in _T1_BAD_PREFIX:
+                found = True
+                break
+            start = idx + 1
+        if found and (has_bj or trusted):
             return True, w, 1
 
     # T2：独有地标，全国基本唯一
@@ -217,11 +245,14 @@ def match_dongcheng(title: str, summary: str = "", source_key: str = "",
             return True, w, 2
     # T3：街道全名（带"街道"后缀的在全国范围极少重名，直接认可）
     for w in STREETS:
-        if w in text:
+        if _plain_hit(text, w) is not None:
             return True, w, 3
     if _has_context(text, source_key, bm):
+        # 明确写的是其它区（如石景山）且全文无“东城”时，街道简称不可作数
+        if _only_other_district(text):
+            return False, "", 0
         for w in STREET_PLAIN:
-            if w in text:
+            if _plain_hit(text, w) is not None:
                 return True, w, 3
     return False, "", 0
 
@@ -236,7 +267,8 @@ def _alias_hit_pos(text: str, alias: str):
         i = text.find(alias, start)
         if i < 0:
             return None
-        prefix = text[max(0, i - 2):i]
+        # “区文旅局”这类简称前若紧接其它区名（如“石景山区文旅局”），跳过
+        prefix = text[max(0, i - 4):i]
         if not any(d in prefix for d in _OTHER_DISTRICTS):
             return i
         start = i + 1
@@ -256,11 +288,16 @@ def match_units(title: str, body: str = "", byline: str = "") -> list:
     byline = byline or ""
     # 检索文本：标题 + 正文；署名单独记位置（视为最靠前）
     text = f"{title} {body}"
+    # 文档级语境：只有全文出现“东城”时，才允许把“区文旅局”这类泛称
+    # 归到东城区；否则同一篇文章里的“区X局”可能是别的区。
+    doc_has_dc = "东城" in f"{text} {byline}"
     hits = {}  # canonical -> [rank, best_pos]
     for canon, rank, aliases in UNITS_TABLE:
         best = None
         for a in [canon] + list(aliases):
             if not a:
+                continue
+            if a.startswith("区") and not doc_has_dc:
                 continue
             p = _alias_hit_pos(text, a)
             if p is not None and (best is None or p < best):
